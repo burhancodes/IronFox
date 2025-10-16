@@ -1,0 +1,151 @@
+name: Release IronFox
+
+on:
+  workflow_call:
+    inputs:
+      version_name:
+        description: "Version name for the release"
+        required: true
+        type: string
+      draft:
+        description: "Create as draft release"
+        required: false
+        type: boolean
+        default: false
+      prerelease:
+        description: "Mark as pre-release"
+        required: false
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: "Version name for the release"
+        required: true
+        type: string
+      draft:
+        description: "Create as draft release"
+        required: false
+        type: boolean
+        default: false
+      prerelease:
+        description: "Mark as pre-release"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: ironfox-*-artifacts
+          merge-multiple: false
+
+      - name: Verify artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Downloaded artifacts:"
+          find artifacts -type f -name "*.apk" -ls || true
+
+          APK_COUNT=$(find artifacts -name "*.apk" | wc -l)
+          if [[ "$APK_COUNT" -eq 0 ]]; then
+            echo "Error: No APK files found in artifacts"
+            exit 1
+          fi
+
+          echo "Found $APK_COUNT APK files"
+
+      - name: Get release notes
+        shell: bash
+        env:
+          VERSION_NAME: ${{ inputs.version_name }}
+        run: |
+          set -euo pipefail
+          # Strip leading 'v' if present for the API call
+          BUILD_VERSION="${VERSION_NAME#v}"
+          RELEASE_NOTES=$(curl -s "https://gitlab.com/api/v4/projects/ironfox-oss%2FIronFox/releases/v${BUILD_VERSION}" | jq -r .description | sed '/## Checksums/,/This release was automatically generated/d')
+
+          if [[ -z "$RELEASE_NOTES" || "$RELEASE_NOTES" == "null" ]]; then
+            RELEASE_NOTES="Release ${VERSION_NAME}"
+          fi
+
+          echo "RELEASE_NOTES<<EOF" >> $GITHUB_ENV
+          echo "$RELEASE_NOTES" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Format release notes
+        shell: bash
+        env:
+          VERSION_NAME: ${{ inputs.version_name }}
+        run: |
+          set -euo pipefail
+          {
+            echo "$RELEASE_NOTES"
+            echo
+            echo "## 📱 Downloads"
+            echo
+            echo "Choose the APK that matches your device architecture:"
+            echo
+            echo "- **arm64-v8a**: Modern 64-bit ARM devices (most recent Android phones/tablets)"
+            echo "- **armeabi-v7a**: Older 32-bit ARM devices"
+            echo "- **x86_64**: 64-bit x86 devices (some tablets, emulators)"
+            echo
+            echo "If you're unsure, try **arm64-v8a** first."
+          } > notes.md
+
+          echo "Release notes preview:"
+          echo "=================================="
+          cat notes.md
+
+      - name: Create or update tag
+        shell: bash
+        env:
+          VERSION_NAME: ${{ inputs.version_name }}
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/$VERSION_NAME" >/dev/null 2>&1; then
+            echo "Tag $VERSION_NAME already exists"
+          else
+            echo "Creating tag $VERSION_NAME"
+            git tag "$VERSION_NAME"
+            git push origin "$VERSION_NAME"
+          fi
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version_name }}
+          name: "IronFox ${{ inputs.version_name }}"
+          body_path: notes.md
+          draft: ${{ inputs.draft || false }}
+          prerelease: ${{ inputs.prerelease || false }}
+          files: |
+            artifacts/**/*.apk
+
+      - name: Release summary
+        shell: bash
+        env:
+          RELEASE_URL: ${{ steps.create_release.outputs.url }}
+          VERSION_NAME: ${{ inputs.version_name }}
+        run: |
+          set -euo pipefail
+          echo "Release created successfully!"
+          echo "Version: $VERSION_NAME"
+          echo "URL: $RELEASE_URL"
+          echo "APK files included:"
+          find artifacts -name "*.apk" -printf "  - %f\n" || true
