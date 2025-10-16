@@ -1,0 +1,381 @@
+name: Build IronFox (Docker)
+
+on:
+  push:
+    branches:
+      - '*'
+    tags:
+      - '*'
+  pull_request:
+    branches:
+      - '*'
+  workflow_dispatch:
+    inputs:
+      buildType:
+        description: 'Build type (ci or release).'
+        required: true
+        type: choice
+        default: 'ci'
+        options:
+          - ci
+          - release
+      version_name:
+        description: "Version name for the build (optional, auto-detected from latest tag if not provided)"
+        required: false
+        type: string
+      
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ironfox-docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  meta:
+    name: Compute version and mode
+    runs-on: ubuntu-latest
+    outputs:
+      version_name: ${{ steps.compute.outputs.version_name }}
+      build_type: ${{ steps.compute.outputs.build_type }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: compute
+        name: Determine version_name and build_type
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version_name }}
+          INPUT_BUILDTYPE: ${{ github.event.inputs.buildType }}
+        run: |
+          set -euo pipefail
+          # Default build type
+          BUILD_TYPE="${INPUT_BUILDTYPE:-ci}"
+          # If triggered by a tag push, mark as release but don't auto-release
+          if [[ "${{ github.event_name }}" == "push" && "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" ]]; then
+            VERSION_NAME="${GITHUB_REF_NAME}"
+            BUILD_TYPE="release"
+          elif [[ -n "${INPUT_VERSION:-}" ]]; then
+            VERSION_NAME="${INPUT_VERSION}"
+          else
+            VERSION_NAME=$(git tag --sort=-creatordate | head -n 1 || true)
+            if [[ -z "$VERSION_NAME" ]]; then
+              VERSION_NAME="untagged-$(date -u +%Y%m%d%H%M%S)"
+            fi
+          fi
+          echo "version_name=$VERSION_NAME" | tee -a "$GITHUB_OUTPUT"
+          echo "build_type=$BUILD_TYPE" | tee -a "$GITHUB_OUTPUT"
+  build-aarch64:
+    needs: meta
+    name: Build arm64 (Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Maximize build space
+        uses: endersonmenezes/free-disk-space@dd13eb48e709830a7ec4e50692e841be6b400d90
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+          remove_swap: true
+          remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
+          remove_packages_one_command: true
+          remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/share/glade* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell"
+
+      - name: Setup swap space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 10
+
+      - name: Pull prebuilt Docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull registry.gitlab.com/ironfox-oss/ironfox:latest
+
+      - name: Setup Safe Browsing API Key (optional)
+        env:
+          SB_GAPI_KEY_B64: ${{ secrets.SB_GAPI_KEY_B64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${SB_GAPI_KEY_B64:-}" ]]; then
+            echo "$SB_GAPI_KEY_B64" | base64 -d > safebrowsing_key.txt
+            echo "SB_GAPI_KEY_FILE=/app/safebrowsing_key.txt" >> "$GITHUB_ENV"
+          else
+            echo "No SB_GAPI_KEY_B64 provided; Safe Browsing will be disabled."
+          fi
+
+      - name: Setup Signing Keys (optional)
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE }}
+          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
+          KEYSTORE_KEY_ALIAS: ${{ secrets.KEYSTORE_KEY_ALIAS }}
+          KEYSTORE_KEY_PASS: ${{ secrets.KEYSTORE_KEY_PASS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${KEYSTORE_B64:-}" ]]; then
+            echo "$KEYSTORE_B64" | base64 -d > release-key.jks
+            echo "KEYSTORE=/app/release-key.jks" >> "$GITHUB_ENV"
+            echo "KEYSTORE_PASS=$KEYSTORE_PASS" >> "$GITHUB_ENV"
+            echo "KEYSTORE_KEY_ALIAS=$KEYSTORE_KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "KEYSTORE_KEY_PASS=$KEYSTORE_KEY_PASS" >> "$GITHUB_ENV"
+          else
+            echo "No signing keystore provided; build outputs will be unsigned." 
+          fi
+
+      - name: Build inside container (arm64)
+        env:
+          VARIANT: arm64
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="registry.gitlab.com/ironfox-oss/ironfox:latest"
+
+          # Run inside container. ENTRYPOINT in image activates environment.
+          docker run --rm \
+            -v "${{ github.workspace }}:/app" \
+            --shm-size=2g \
+            -e "VARIANT=${VARIANT}" \
+            -e "SB_GAPI_KEY_FILE=${SB_GAPI_KEY_FILE:-}" \
+            -e "KEYSTORE=${KEYSTORE:-}" \
+            -e "KEYSTORE_PASS=${KEYSTORE_PASS:-}" \
+            -e "KEYSTORE_KEY_ALIAS=${KEYSTORE_KEY_ALIAS:-}" \
+            -e "KEYSTORE_KEY_PASS=${KEYSTORE_KEY_PASS:-}" \
+            "$IMAGE" \
+            bash -lc '
+              set -euo pipefail
+              cd /app
+              bash ./scripts/github-build.sh "$VARIANT" apk
+            '
+
+      - name: Upload artifacts (APKs and logs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ironfox-arm64-artifacts
+          path: |
+            ${{ github.workspace }}/artifacts/**/*.apk
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Cleanup sensitive files
+        if: always()
+        shell: bash
+        run: |
+          rm -f safebrowsing_key.txt release-key.jks || true
+
+  build-aarch32:
+    needs: meta
+    name: Build arm (Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Maximize build space
+        uses: endersonmenezes/free-disk-space@dd13eb48e709830a7ec4e50692e841be6b400d90
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+          remove_swap: true
+          remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
+          remove_packages_one_command: true
+          remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/share/glade* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell"
+
+      - name: Setup swap space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 10
+
+      - name: Pull prebuilt Docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull registry.gitlab.com/ironfox-oss/ironfox:latest
+
+      - name: Setup Safe Browsing API Key (optional)
+        env:
+          SB_GAPI_KEY_B64: ${{ secrets.SB_GAPI_KEY_B64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${SB_GAPI_KEY_B64:-}" ]]; then
+            echo "$SB_GAPI_KEY_B64" | base64 -d > safebrowsing_key.txt
+            echo "SB_GAPI_KEY_FILE=/app/safebrowsing_key.txt" >> "$GITHUB_ENV"
+          else
+            echo "No SB_GAPI_KEY_B64 provided; Safe Browsing will be disabled."
+          fi
+
+      - name: Setup Signing Keys (optional)
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE }}
+          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
+          KEYSTORE_KEY_ALIAS: ${{ secrets.KEYSTORE_KEY_ALIAS }}
+          KEYSTORE_KEY_PASS: ${{ secrets.KEYSTORE_KEY_PASS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${KEYSTORE_B64:-}" ]]; then
+            echo "$KEYSTORE_B64" | base64 -d > release-key.jks
+            echo "KEYSTORE=/app/release-key.jks" >> "$GITHUB_ENV"
+            echo "KEYSTORE_PASS=$KEYSTORE_PASS" >> "$GITHUB_ENV"
+            echo "KEYSTORE_KEY_ALIAS=$KEYSTORE_KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "KEYSTORE_KEY_PASS=$KEYSTORE_KEY_PASS" >> "$GITHUB_ENV"
+          else
+            echo "No signing keystore provided; build outputs will be unsigned." 
+          fi
+
+      - name: Build inside container (arm)
+        env:
+          VARIANT: arm
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="registry.gitlab.com/ironfox-oss/ironfox:latest"
+
+          docker run --rm \
+            -v "${{ github.workspace }}:/app" \
+            --shm-size=2g \
+            -e "VARIANT=${VARIANT}" \
+            -e "SB_GAPI_KEY_FILE=${SB_GAPI_KEY_FILE:-}" \
+            -e "KEYSTORE=${KEYSTORE:-}" \
+            -e "KEYSTORE_PASS=${KEYSTORE_PASS:-}" \
+            -e "KEYSTORE_KEY_ALIAS=${KEYSTORE_KEY_ALIAS:-}" \
+            -e "KEYSTORE_KEY_PASS=${KEYSTORE_KEY_PASS:-}" \
+            "$IMAGE" \
+            bash -lc '
+              set -euo pipefail
+              cd /app
+              bash ./scripts/github-build.sh "$VARIANT" apk
+            '
+
+      - name: Upload artifacts (APKs and logs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ironfox-arm-artifacts
+          path: |
+            ${{ github.workspace }}/artifacts/**/*.apk
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Cleanup sensitive files
+        if: always()
+        shell: bash
+        run: |
+          rm -f safebrowsing_key.txt release-key.jks || true
+
+  build-x86:
+    needs: meta
+    name: Build x86_64 (Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Maximize build space
+        uses: endersonmenezes/free-disk-space@dd13eb48e709830a7ec4e50692e841be6b400d90
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+          remove_swap: true
+          remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
+          remove_packages_one_command: true
+          remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/share/glade* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell"
+
+      - name: Setup swap space
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 10
+
+      - name: Pull prebuilt Docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull registry.gitlab.com/ironfox-oss/ironfox:latest
+
+      - name: Setup Safe Browsing API Key (optional)
+        env:
+          SB_GAPI_KEY_B64: ${{ secrets.SB_GAPI_KEY_B64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${SB_GAPI_KEY_B64:-}" ]]; then
+            echo "$SB_GAPI_KEY_B64" | base64 -d > safebrowsing_key.txt
+            echo "SB_GAPI_KEY_FILE=/app/safebrowsing_key.txt" >> "$GITHUB_ENV"
+          else
+            echo "No SB_GAPI_KEY_B64 provided; Safe Browsing will be disabled."
+          fi
+
+      - name: Setup Signing Keys (optional)
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE }}
+          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
+          KEYSTORE_KEY_ALIAS: ${{ secrets.KEYSTORE_KEY_ALIAS }}
+          KEYSTORE_KEY_PASS: ${{ secrets.KEYSTORE_KEY_PASS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${KEYSTORE_B64:-}" ]]; then
+            echo "$KEYSTORE_B64" | base64 -d > release-key.jks
+            echo "KEYSTORE=/app/release-key.jks" >> "$GITHUB_ENV"
+            echo "KEYSTORE_PASS=$KEYSTORE_PASS" >> "$GITHUB_ENV"
+            echo "KEYSTORE_KEY_ALIAS=$KEYSTORE_KEY_ALIAS" >> "$GITHUB_ENV"
+            echo "KEYSTORE_KEY_PASS=$KEYSTORE_KEY_PASS" >> "$GITHUB_ENV"
+          else
+            echo "No signing keystore provided; build outputs will be unsigned." 
+          fi
+
+      - name: Build inside container (x86_64)
+        env:
+          VARIANT: x86_64
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="registry.gitlab.com/ironfox-oss/ironfox:latest"
+
+          docker run --rm \
+            -v "${{ github.workspace }}:/app" \
+            --shm-size=2g \
+            -e "VARIANT=${VARIANT}" \
+            -e "SB_GAPI_KEY_FILE=${SB_GAPI_KEY_FILE:-}" \
+            -e "KEYSTORE=${KEYSTORE:-}" \
+            -e "KEYSTORE_PASS=${KEYSTORE_PASS:-}" \
+            -e "KEYSTORE_KEY_ALIAS=${KEYSTORE_KEY_ALIAS:-}" \
+            -e "KEYSTORE_KEY_PASS=${KEYSTORE_KEY_PASS:-}" \
+            "$IMAGE" \
+            bash -lc '
+              set -euo pipefail
+              cd /app
+              bash ./scripts/github-build.sh "$VARIANT" apk
+            '
+
+      - name: Upload artifacts (APKs and logs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ironfox-x86_64-artifacts
+          path: |
+            ${{ github.workspace }}/artifacts/**/*.apk
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Cleanup sensitive files
+        if: always()
+        shell: bash
+        run: |
+          rm -f safebrowsing_key.txt release-key.jks || true
