@@ -3,19 +3,19 @@ name: Build IronFox (Docker)
 on:
   push:
     branches:
-      - '*'
+      - "*"
     tags:
-      - '*'
+      - "*"
   pull_request:
     branches:
-      - '*'
+      - "*"
   workflow_dispatch:
     inputs:
       buildType:
-        description: 'Build type (ci or release).'
+        description: "Build type (ci or release)."
         required: true
         type: choice
-        default: 'ci'
+        default: "ci"
         options:
           - ci
           - release
@@ -23,7 +23,6 @@ on:
         description: "Version name for the build (optional, auto-detected from latest tag if not provided)"
         required: false
         type: string
-      
 
 permissions:
   contents: read
@@ -67,6 +66,22 @@ jobs:
           fi
           echo "version_name=$VERSION_NAME" | tee -a "$GITHUB_OUTPUT"
           echo "build_type=$BUILD_TYPE" | tee -a "$GITHUB_OUTPUT"
+      - name: Export build metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build-metadata
+          {
+            echo "version_name=${{ steps.compute.outputs.version_name }}"
+            echo "build_type=${{ steps.compute.outputs.build_type }}"
+          } > build-metadata/metadata.env
+      - name: Upload build metadata artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ironfox-build-metadata
+          path: build-metadata/metadata.env
+          if-no-files-found: error
+          retention-days: 7
   build-aarch64:
     needs: meta
     name: Build arm64 (Docker)
@@ -129,7 +144,7 @@ jobs:
             echo "KEYSTORE_KEY_ALIAS=$KEYSTORE_KEY_ALIAS" >> "$GITHUB_ENV"
             echo "KEYSTORE_KEY_PASS=$KEYSTORE_KEY_PASS" >> "$GITHUB_ENV"
           else
-            echo "No signing keystore provided; build outputs will be unsigned." 
+            echo "No signing keystore provided; build outputs will be unsigned."
           fi
 
       - name: Build inside container (arm64)
@@ -234,7 +249,7 @@ jobs:
             echo "KEYSTORE_KEY_ALIAS=$KEYSTORE_KEY_ALIAS" >> "$GITHUB_ENV"
             echo "KEYSTORE_KEY_PASS=$KEYSTORE_KEY_PASS" >> "$GITHUB_ENV"
           else
-            echo "No signing keystore provided; build outputs will be unsigned." 
+            echo "No signing keystore provided; build outputs will be unsigned."
           fi
 
       - name: Build inside container (arm)
@@ -338,7 +353,7 @@ jobs:
             echo "KEYSTORE_KEY_ALIAS=$KEYSTORE_KEY_ALIAS" >> "$GITHUB_ENV"
             echo "KEYSTORE_KEY_PASS=$KEYSTORE_KEY_PASS" >> "$GITHUB_ENV"
           else
-            echo "No signing keystore provided; build outputs will be unsigned." 
+            echo "No signing keystore provided; build outputs will be unsigned."
           fi
 
       - name: Build inside container (x86_64)
