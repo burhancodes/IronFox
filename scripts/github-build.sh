@@ -35,6 +35,10 @@ echo "=== Setting up build environment ==="
 ./scripts/get_sources.sh
 
 source scripts/mocha-patch.sh
+# Target release
+if [[ -z "${IRONFOX_RELEASE+x}" ]]; then
+  export IRONFOX_RELEASE=1
+fi
 source scripts/env_local.sh
 source scripts/versions.sh
 
@@ -48,13 +52,6 @@ if [[ -z "${IRONFOX_VERSION:-}" ]]; then
     IRONFOX_VERSION="$(date +%Y%m%d-%H%M%S)"
 fi
 
-echo "Debug: IRONFOX_VERSION = $IRONFOX_VERSION"
-echo "Debug: VARIANT = $VARIANT_ARG"
-echo "Debug: mozilla_release = ${mozilla_release:-not_set}"
-echo "Debug: KEYSTORE = ${KEYSTORE:-not_set}"
-echo "Debug: KEYSTORE_KEY_ALIAS = ${KEYSTORE_KEY_ALIAS:-not_set}"
-echo "Debug: ANDROID_HOME = ${ANDROID_HOME:-not_set}"
-
 # Prebuild
 echo "=== Running prebuild ==="
 ./scripts/prebuild.sh "$VARIANT_ARG"
@@ -64,23 +61,14 @@ echo "=== Building APK ==="
 ./scripts/build.sh "$TARGET_KIND"
 
 # Post-build
-echo "=== Processing build outputs ==="
 if [[ "$TARGET_KIND" == "apk" ]]; then
-    echo "Searching for built APKs..."
-    
+
     # Find the built APK
     APK_PATTERN="$mozilla_release/obj/gradle/build/mobile/android/fenix/app/outputs/apk/fenix/release/*.apk"
-    echo "Searching for APKs at: $APK_PATTERN"
-    
     APK_FILES=$(find "$mozilla_release/obj/gradle/build/mobile/android/fenix/app/outputs/" -name "*.apk" 2>/dev/null || true)
-    
+
     if [[ -n "$APK_FILES" ]]; then
-        echo "Found APK files:"
-        echo "$APK_FILES"
-        
         for APK_IN in $APK_FILES; do
-            echo "Processing APK: $APK_IN"
-            
             # Extract architecture
             if [[ "$APK_IN" =~ arm64-v8a ]]; then
                 BUILD_ABI="arm64-v8a"
@@ -97,15 +85,11 @@ if [[ "$TARGET_KIND" == "apk" ]]; then
                     *) BUILD_ABI="$VARIANT_ARG" ;;
                 esac
             fi
-            
             # Generate output filename
             VERSION="${IRONFOX_VERSION:-$(date +%Y%m%d-%H%M%S)}"
             APK_OUT="$APK_ARTIFACTS/IronFox-v${VERSION}-${BUILD_ABI}.apk"
-            
             # Sign APK
             if [[ -n "${KEYSTORE:-}" && -f "${KEYSTORE}" ]]; then
-                echo "Signing APK with keystore: $KEYSTORE"
-                
                 # Check if apksigner exists
                 APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
                 if [[ ! -f "$APKSIGNER" ]]; then
@@ -117,9 +101,7 @@ if [[ "$TARGET_KIND" == "apk" ]]; then
                         echo "Unsigned APK copied to: $APK_OUT"
                         continue
                     fi
-                    echo "Found apksigner at: $APKSIGNER"
                 fi
-                
                 # Sign the APK
                 "$APKSIGNER" sign \
                   --ks="$KEYSTORE" \
@@ -128,30 +110,21 @@ if [[ "$TARGET_KIND" == "apk" ]]; then
                   --key-pass="pass:$KEYSTORE_KEY_PASS" \
                   --out="$APK_OUT" \
                   "$APK_IN"
-                
                 # Verify the APK was signed successfully
                 if [[ -f "$APK_OUT" ]]; then
-                    echo "APK signed and saved to: $APK_OUT"
                     # Verify signature
-                    "$APKSIGNER" verify "$APK_OUT" && echo "APK signature verified successfully" || echo "Warning: APK signature verification failed"
+                    "$APKSIGNER" verify "$APK_OUT" || echo "Warning: APK signature verification failed"
                 else
                     echo "Error: Failed to create signed APK, falling back to unsigned"
                     cp -v "$APK_IN" "$APK_OUT"
                 fi
             else
-                echo "No keystore provided, copying unsigned APK"
                 cp -v "$APK_IN" "$APK_OUT"
-                echo "Unsigned APK copied to: $APK_OUT"
             fi
         done
     else
         echo "Warning: No APK files found at $APK_PATTERN"
-        echo "Searching for APKs in entire build directory..."
+
         find "$mozilla_release" -name "*.apk" -ls 2>/dev/null || true
     fi
 fi
-
-# Debug: Show final state
-echo "=== Final artifacts directory ==="
-ls -la artifacts/ || true
-find artifacts/ -name "*.apk" -ls 2>/dev/null || true
