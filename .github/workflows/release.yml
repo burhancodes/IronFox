@@ -11,11 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       version_name:
-        description: "Version name for the release (required)"
-        required: true
-        type: string
-      run_id:
-        description: "GitHub Run ID from docker-build workflow to download artifacts from (required)"
+        description: "Version name for the release (required for manual runs)"
         required: true
         type: string
       draft:
@@ -38,10 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     if: |
       (github.event_name == 'workflow_dispatch') ||
-      (github.event_name == 'workflow_run' && 
-       github.event.workflow_run.conclusion == 'success' && 
-       github.event.workflow_run.event == 'push' &&
-       startsWith(github.event.workflow_run.head_branch, 'refs/tags/'))
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,79 +47,125 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
-          WORKFLOW_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           INPUT_VERSION: ${{ github.event.inputs.version_name }}
-          INPUT_RUN_ID: ${{ github.event.inputs.run_id }}
+          GH_TOKEN: ${{ secrets.PAT }}
         run: |
           set -euo pipefail
-          
-          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+
+          DO_RELEASE=false
+          VERSION_NAME=""
+          RUN_ID=""
+
+          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
+            echo "Auto-release check: triggered by docker-build workflow_run"
+            RUN_ID="$WORKFLOW_RUN_ID"
+            echo "Using workflow run ID: $RUN_ID"
+
+            # Try to download build metadata from triggering run
+            mkdir -p _meta
+            if gh run download "$RUN_ID" --name ironfox-build-metadata --dir _meta; then
+              echo "Downloaded build metadata artifact"
+              set -o allexport
+              source _meta/metadata.env || true
+              set +o allexport
+
+              echo "build_type=${build_type:-}"
+              echo "version_name from metadata=${version_name:-}"
+
+              if [[ "${build_type:-}" == "release" ]]; then
+                DO_RELEASE=true
+                VERSION_NAME="${version_name:-}"
+              else
+                echo "Not a release build (build_type=${build_type:-}), skipping release."
+              fi
+            else
+              echo "No build metadata artifact found; cannot determine build_type. Skipping auto-release."
+            fi
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             echo "Manual release triggered"
-            echo "version_name=$INPUT_VERSION" >> $GITHUB_OUTPUT
-            echo "run_id=$INPUT_RUN_ID" >> $GITHUB_OUTPUT
-          elif [[ "$EVENT_NAME" == "workflow_run" ]]; then
-            echo "Auto-release triggered by successful docker-build workflow"
-            
-            # Extract version from the tag (remove refs/tags/ prefix)
-            VERSION_NAME="${WORKFLOW_HEAD_BRANCH#refs/tags/}"
-            echo "Auto-detected version: $VERSION_NAME"
-            echo "Using workflow run ID: $WORKFLOW_RUN_ID"
-            
-            echo "version_name=$VERSION_NAME" >> $GITHUB_OUTPUT
-            echo "run_id=$WORKFLOW_RUN_ID" >> $GITHUB_OUTPUT
+            if [[ -z "${INPUT_VERSION:-}" ]]; then
+              echo "Error: version_name input is required for manual release"
+              exit 1
+            fi
+            VERSION_NAME="$INPUT_VERSION"
+            # Try to find the most recent successful docker-build run with release metadata
+            echo "Locating latest successful docker-build run with build_type=release..."
+            mapfile -t CANDIDATES < <(gh run list -w "Build IronFox (Docker)" --json databaseId,conclusion,status -q '[.[] | select(.conclusion=="success" and .status=="completed") | .databaseId]' | head -n 15)
+            for id in "${CANDIDATES[@]}"; do
+              rm -rf _meta && mkdir -p _meta
+              if gh run download "$id" --name ironfox-build-metadata --dir _meta >/dev/null 2>&1; then
+                set -o allexport
+                source _meta/metadata.env || true
+                set +o allexport
+                if [[ "${build_type:-}" == "release" ]]; then
+                  RUN_ID="$id"
+                  DO_RELEASE=true
+                  echo "Selected docker-build run: $RUN_ID (build_type=release)"
+                  break
+                fi
+              fi
+            done
+            if [[ "$DO_RELEASE" != "true" ]]; then
+              echo "Error: Could not find a recent successful docker-build run with buildType=release"
+              exit 1
+            fi
           else
             echo "Error: Unexpected event type: $EVENT_NAME"
             exit 1
           fi
 
+          echo "version_name=$VERSION_NAME" >> $GITHUB_OUTPUT
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+          echo "do_release=$DO_RELEASE" >> $GITHUB_OUTPUT
+
       - name: Download Build Artifacts
+        if: ${{ steps.release_params.outputs.do_release == 'true' }}
         shell: bash
         env:
           RUN_ID: ${{ steps.release_params.outputs.run_id }}
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
           set -euo pipefail
-          
+
           if [[ -z "${RUN_ID:-}" ]]; then
             echo "Error: run_id not determined. This should not happen."
             exit 1
           fi
-          
+
           echo "Downloading artifacts from run ID: $RUN_ID"
-          
-          # Create artifacts directory
+
           mkdir -p artifacts
-          
-          # Try to download artifacts - gh run download will show what's available
+
           echo "Attempting to download artifacts..."
           if gh run download "$RUN_ID" --dir artifacts; then
             echo "Successfully downloaded artifacts"
           else
             echo "Failed to download artifacts, checking if any exist..."
-            # List what artifacts are available via API
             gh api "repos/${{ github.repository }}/actions/runs/$RUN_ID/artifacts" --jq '.artifacts[] | "- \(.name) (\(.size_in_bytes) bytes, expires: \(.expires_at))"' || echo "No artifacts found or API error"
             exit 1
           fi
-          
+
           echo "Downloaded artifacts:"
           find artifacts -type f -ls || true
 
       - name: Verify artifacts
+        if: ${{ steps.release_params.outputs.do_release == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
           echo "Downloaded artifacts:"
           find artifacts -type f -name "*.apk" -ls || true
-          
+
           APK_COUNT=$(find artifacts -name "*.apk" | wc -l)
           if [[ "$APK_COUNT" -eq 0 ]]; then
             echo "Error: No APK files found in artifacts"
             exit 1
           fi
-          
+
           echo "Found $APK_COUNT APK files"
 
       - name: Fetch Repository Tags
+        if: ${{ steps.release_params.outputs.do_release == 'true' }}
         id: fetch_tags
         shell: bash
         env:
@@ -134,17 +173,18 @@ jobs:
         run: |
           set -euo pipefail
           git fetch --tags --force origin '+refs/tags/*:refs/tags/*' || true
-          
+
           END="$VERSION_NAME"
           if [[ -z "$END" || "$END" == "HEAD" || "$END" == untagged* ]]; then
             echo "Error: Invalid version name: $END"
             exit 1
           fi
-          
+
           echo "END_TAG=$END" >> $GITHUB_OUTPUT
           echo "END_TAG=$END" >> $GITHUB_ENV
 
       - name: Determine Commit Range
+        if: ${{ steps.release_params.outputs.do_release == 'true' }}
         id: commit_range
         shell: bash
         env:
@@ -152,8 +192,7 @@ jobs:
         run: |
           set -euo pipefail
           END="$END_TAG"
-          
-          # Check if tag already exists
+
           if git rev-parse -q --verify "refs/tags/$END" >/dev/null 2>&1; then
             echo "Tag $END already exists, using it as end point"
             TAG_EXISTS=true
@@ -162,14 +201,13 @@ jobs:
             TAG_EXISTS=false
             END="HEAD"
           fi
-          
-          # Find previous tag
+
           if [[ "$END" == "HEAD" ]]; then
             PREV=$(git describe --tags --abbrev=0 2>/dev/null || true)
           else
             PREV=$(git describe --tags --abbrev=0 "${END}^" 2>/dev/null || true)
           fi
-          
+
           if [[ -n "$PREV" ]]; then
             RANGE="$PREV..$END"
             TAG_INFO="$PREV ($(git log -1 --format=%ad --date=short "$PREV" 2>/dev/null || echo "unknown date"))"
@@ -178,15 +216,16 @@ jobs:
             RANGE="$FIRST..$END"
             TAG_INFO="first commit"
           fi
-          
+
           echo "Using $TAG_INFO as starting point for release notes (range: $RANGE)"
-          
+
           echo "COMMIT_RANGE=$RANGE" >> $GITHUB_OUTPUT
           echo "TAG_INFO=$TAG_INFO" >> $GITHUB_OUTPUT
           echo "PREV_TAG=$PREV" >> $GITHUB_OUTPUT
           echo "TAG_EXISTS=$TAG_EXISTS" >> $GITHUB_OUTPUT
 
       - name: Generate Commit List
+        if: ${{ steps.release_params.outputs.do_release == 'true' }}
         id: generate_commits
         shell: bash
         env:
@@ -195,68 +234,60 @@ jobs:
           set -euo pipefail
           REPO='${{ github.repository }}'
           LOG_FMT='- %s ([%h](https://github.com/'"$REPO"'/commit/%H))'
-          
+
           ALL_COMMITS=$(git log $COMMIT_RANGE --no-merges --pretty=format:"$LOG_FMT" 2>/dev/null || true)
-          
+
           echo "ALL_COMMITS<<EOF" >> $GITHUB_ENV
           echo "$ALL_COMMITS" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
 
       - name: Categorize Changes
+        if: ${{ steps.release_params.outputs.do_release == 'true' }}
         id: categorize_changes
         shell: bash
         run: |
           set -euo pipefail
-          
-          # Define regex patterns for categorization (in priority order)
+
           RX_BREAKING='BREAKING CHANGE|\!:'
           RX_FEATURE='(^|[^a-z])(feat|feature|add|introduce|implement|enhance|improve)([^a-z]|$|:)'
           RX_FIX='(^|[^a-z])(fix|bug|issue|resolve|patch|repair|correct|hotfix|bugfix|crash|error|problem|broken|fail|exception)([^a-z]|$|:)'
           RX_PERF='(^|[^a-z])(perf|performance|speed|optimi[sz]e)([^a-z]|$|:)'
           RX_REFACTOR='(^|[^a-z])(refactor)([^a-z]|$|:)'
           RX_SECURITY='(^|[^a-z])(security|vuln|cve)([^a-z]|$|:)'
-          
-          # Create a temporary file to track already categorized commits
+
           TEMP_FILE=$(mktemp)
           echo "$ALL_COMMITS" > "$TEMP_FILE"
-          
-          # Categorize commits in priority order (breaking changes first, then features, etc.)
-          # Each step removes matched commits from the temp file to prevent duplicates
-          
-          # 1. Breaking changes (highest priority)
+
           HIGHLIGHTS=$(grep -Ei "$RX_BREAKING|$RX_FEATURE" "$TEMP_FILE" || true)
           if [[ -n "$HIGHLIGHTS" ]]; then
             grep -Eiv "$RX_BREAKING|$RX_FEATURE" "$TEMP_FILE" > "${TEMP_FILE}.tmp" || true
             mv "${TEMP_FILE}.tmp" "$TEMP_FILE"
           fi
-          
-          # 2. Fixes (security, performance, refactor, and general fixes)
+
           FIXES=$(grep -Ei "$RX_SECURITY|$RX_PERF|$RX_REFACTOR|$RX_FIX" "$TEMP_FILE" || true)
           if [[ -n "$FIXES" ]]; then
             grep -Eiv "$RX_SECURITY|$RX_PERF|$RX_REFACTOR|$RX_FIX" "$TEMP_FILE" > "${TEMP_FILE}.tmp" || true
             mv "${TEMP_FILE}.tmp" "$TEMP_FILE"
           fi
-          
-          # 3. Everything else that wasn't categorized
+
           OTHER=$(cat "$TEMP_FILE" || true)
-          
-          # Clean up
+
           rm -f "$TEMP_FILE" "${TEMP_FILE}.tmp"
-          
-          # Store categorized commits
+
           echo "HIGHLIGHTS<<EOF" >> $GITHUB_ENV
           echo "$HIGHLIGHTS" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
-          
+
           echo "FIXES<<EOF" >> $GITHUB_ENV
           echo "$FIXES" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
-          
+
           echo "OTHER_CHANGES<<EOF" >> $GITHUB_ENV
           echo "$OTHER" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
 
       - name: Format Release Notes
+        if: ${{ steps.release_params.outputs.do_release == 'true' }}
         id: format_notes
         shell: bash
         env:
@@ -267,7 +298,7 @@ jobs:
         run: |
           set -euo pipefail
           REPO='${{ github.repository }}'
-          
+
           {
             echo "# 🦊 IronFox $END_TAG"
             echo
@@ -279,19 +310,19 @@ jobs:
             echo
             echo "## 📝 Changes since $TAG_INFO:"
             echo
-            
+
             if [[ -n "$HIGHLIGHTS" ]]; then
               echo "### 🚀 Highlights"
               echo "$HIGHLIGHTS"
               echo
             fi
-            
+
             if [[ -n "$FIXES" ]]; then
               echo "### 🐛 Fixes"
               echo "$FIXES"
               echo
             fi
-            
+
             if [[ -z "$HIGHLIGHTS$FIXES" ]]; then
               if [[ -n "$OTHER_CHANGES" ]]; then
                 echo "### 📋 Changes"
@@ -306,7 +337,7 @@ jobs:
               echo "$OTHER_CHANGES"
               echo
             fi
-            
+
             echo "## 📱 Downloads"
             echo
             echo "Choose the APK that matches your device architecture:"
@@ -317,13 +348,13 @@ jobs:
             echo
             echo "If you're unsure, try **arm64-v8a** first."
           } > notes.md
-          
+
           echo "📋 Generated release notes preview:"
           echo "=================================="
           sed -n '1,50p' notes.md
 
       - name: Create or Update Tag
-        if: ${{ steps.commit_range.outputs.TAG_EXISTS == 'false' }}
+        if: ${{ steps.release_params.outputs.do_release == 'true' && steps.commit_range.outputs.TAG_EXISTS == 'false' }}
         shell: bash
         env:
           VERSION_NAME: ${{ steps.release_params.outputs.version_name }}
@@ -334,6 +365,7 @@ jobs:
           git push origin "$VERSION_NAME"
 
       - name: Create Release
+        if: ${{ steps.release_params.outputs.do_release == 'true' }}
         id: create_release
         uses: softprops/action-gh-release@v2
         with:
@@ -346,6 +378,7 @@ jobs:
             artifacts/**/*.apk
 
       - name: Release Summary
+        if: ${{ steps.release_params.outputs.do_release == 'true' }}
         shell: bash
         env:
           RELEASE_URL: ${{ steps.create_release.outputs.url }}
