@@ -14,6 +14,27 @@ on:
         description: "Version name for the release (required for manual runs)"
         required: true
         type: string
+      artifact_source:
+        description: "Source of artifacts to release"
+        required: true
+        type: choice
+        options:
+          - "auto-detect-release"
+          - "auto-detect-ci"
+          - "specific-workflow"
+        default: "auto-detect-release"
+      workflow_run_id:
+        description: "Specific workflow run ID (only used when artifact_source is 'specific-workflow')"
+        required: false
+        type: string
+      build_type:
+        description: "Build type to search for (when using auto-detect)"
+        required: false
+        type: choice
+        options:
+          - "release"
+          - "ci"
+        default: "release"
       draft:
         description: "Create as draft release"
         required: false
@@ -48,6 +69,9 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
           INPUT_VERSION: ${{ github.event.inputs.version_name }}
+          INPUT_ARTIFACT_SOURCE: ${{ github.event.inputs.artifact_source }}
+          INPUT_WORKFLOW_RUN_ID: ${{ github.event.inputs.workflow_run_id }}
+          INPUT_BUILD_TYPE: ${{ github.event.inputs.build_type }}
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
           set -euo pipefail
@@ -88,26 +112,59 @@ jobs:
               exit 1
             fi
             VERSION_NAME="$INPUT_VERSION"
-            # Try to find the most recent successful docker-build run with release metadata
-            echo "Locating latest successful docker-build run with build_type=release..."
-            mapfile -t CANDIDATES < <(gh run list -w "Build IronFox (Docker)" --json databaseId,conclusion,status -q '[.[] | select(.conclusion=="success" and .status=="completed") | .databaseId]' | head -n 15)
-            for id in "${CANDIDATES[@]}"; do
-              rm -rf _meta && mkdir -p _meta
-              if gh run download "$id" --name ironfox-build-metadata --dir _meta >/dev/null 2>&1; then
+            
+            # Handle artifact source based on user selection
+            ARTIFACT_SOURCE="${INPUT_ARTIFACT_SOURCE:-auto-detect-release}"
+            echo "Artifact source: $ARTIFACT_SOURCE"
+            
+            if [[ "$ARTIFACT_SOURCE" == "specific-workflow" ]]; then
+              # Use specific workflow run ID provided by user
+              if [[ -z "${INPUT_WORKFLOW_RUN_ID:-}" ]]; then
+                echo "Error: workflow_run_id is required when artifact_source is 'specific-workflow'"
+                exit 1
+              fi
+              RUN_ID="$INPUT_WORKFLOW_RUN_ID"
+              echo "Using specified workflow run ID: $RUN_ID"
+              
+              # Verify the run exists and has artifacts
+              mkdir -p _meta
+              if gh run download "$RUN_ID" --name ironfox-build-metadata --dir _meta >/dev/null 2>&1; then
                 set -o allexport
                 source _meta/metadata.env || true
                 set +o allexport
-                if [[ "${build_type:-}" == "release" ]]; then
-                  RUN_ID="$id"
-                  DO_RELEASE=true
-                  echo "Selected docker-build run: $RUN_ID (build_type=release)"
-                  break
-                fi
+                echo "Found metadata from run $RUN_ID (build_type=${build_type:-unknown})"
+                DO_RELEASE=true
+              else
+                echo "Warning: Could not download metadata from run $RUN_ID, but proceeding anyway"
+                DO_RELEASE=true
               fi
-            done
-            if [[ "$DO_RELEASE" != "true" ]]; then
-              echo "Error: Could not find a recent successful docker-build run with buildType=release"
-              exit 1
+            else
+              # Auto-detect based on build type
+              SEARCH_BUILD_TYPE="${INPUT_BUILD_TYPE:-release}"
+              if [[ "$ARTIFACT_SOURCE" == "auto-detect-ci" ]]; then
+                SEARCH_BUILD_TYPE="ci"
+              fi
+              
+              echo "Locating latest successful docker-build run with build_type=$SEARCH_BUILD_TYPE..."
+              mapfile -t CANDIDATES < <(gh run list -w "Build IronFox (Docker)" --json databaseId,conclusion,status -q '[.[] | select(.conclusion=="success" and .status=="completed") | .databaseId]' | head -n 15)
+              for id in "${CANDIDATES[@]}"; do
+                rm -rf _meta && mkdir -p _meta
+                if gh run download "$id" --name ironfox-build-metadata --dir _meta >/dev/null 2>&1; then
+                  set -o allexport
+                  source _meta/metadata.env || true
+                  set +o allexport
+                  if [[ "${build_type:-}" == "$SEARCH_BUILD_TYPE" ]]; then
+                    RUN_ID="$id"
+                    DO_RELEASE=true
+                    echo "Selected docker-build run: $RUN_ID (build_type=$SEARCH_BUILD_TYPE)"
+                    break
+                  fi
+                fi
+              done
+              if [[ "$DO_RELEASE" != "true" ]]; then
+                echo "Error: Could not find a recent successful docker-build run with build_type=$SEARCH_BUILD_TYPE"
+                exit 1
+              fi
             fi
           else
             echo "Error: Unexpected event type: $EVENT_NAME"
