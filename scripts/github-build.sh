@@ -45,6 +45,36 @@ fi
 
 mkdir -p artifacts
 
+ensure_gecko_source_metadata() {
+    local repo_path="${mozilla_release:-}" sed_bin="${SED:-sed}"
+
+    if [[ -z "$repo_path" || ! -d "$repo_path/.git" ]]; then
+        return
+    fi
+
+    local repo_url commit
+    repo_url=$(git -C "$repo_path" remote get-url origin 2>/dev/null || true)
+    commit=$(git -C "$repo_path" rev-parse HEAD 2>/dev/null || true)
+
+    if [[ -n "$repo_url" ]]; then
+        export MOZ_SOURCE_REPO="$repo_url"
+    fi
+
+    if [[ -n "$commit" ]]; then
+        export MOZ_SOURCE_CHANGESET="$commit"
+    fi
+
+    local mozconfig="$repo_path/mozconfig"
+    if [[ -f "$mozconfig" ]]; then
+        if [[ -n "$repo_url" ]]; then
+            "$sed_bin" -i "s|^export MOZ_SOURCE_REPO=.*|export MOZ_SOURCE_REPO='$repo_url'|" "$mozconfig"
+        fi
+        if [[ -n "$commit" ]]; then
+            "$sed_bin" -i "s|^export MOZ_SOURCE_CHANGESET=.*|export MOZ_SOURCE_CHANGESET='$commit'|" "$mozconfig"
+        fi
+    fi
+}
+
 # Setup environment variables similar to env_docker.sh
 export ANDROID_SDK_ROOT="${ANDROID_HOME:-/root/android-sdk}"
 export ANDROID_HOME="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
@@ -84,6 +114,7 @@ fi
 
 bash -x ./scripts/get_sources.sh
 source "scripts/env_local.sh"
+ensure_gecko_source_metadata
 
 # Apply mocha patch
 if [[ -f "scripts/mocha-patch.sh" ]]; then
@@ -101,6 +132,7 @@ if [[ -z "${IRONFOX_VERSION:-}" ]]; then
 fi
 
 bash -x ./scripts/prebuild.sh "$VARIANT_ARG"
+ensure_gecko_source_metadata
 
 if [[ "$BUILD_TYPE" == "bundle" ]]; then
     export MOZ_ANDROID_FAT_AAR_ARM64_V8A="$AAR_ARTIFACTS/geckoview-arm64-v8a.zip"
