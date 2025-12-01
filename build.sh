@@ -26,16 +26,41 @@ sed -i 's/ff42414d/ff1e1e2e/g' patched/smali*/mozilla/components/ui/colors/Photo
 sed -i 's/ff2b2a33/ff11111b/g' patched/smali*/mozilla/components/ui/colors/PhotonColors.smali
 sed -i 's/ff1c1b22/ff1e1e2e/g' patched/smali*/mozilla/components/ui/colors/PhotonColors.smali
 
-# Patch colors.xml - Grey colors to Catppuccin Mocha
-sed -i 's/#f9f9fa/#bac2de/g' patched/res/values/colors.xml
-sed -i 's/#ededf0/#a6adc8/g' patched/res/values/colors.xml
-sed -i 's/#d7d7db/#6c7086/g' patched/res/values/colors.xml
-sed -i 's/#b1b1b3/#585b70/g' patched/res/values/colors.xml
-sed -i 's/#737373/#45475a/g' patched/res/values/colors.xml
-sed -i 's/#4a4a4f/#313244/g' patched/res/values/colors.xml
-sed -i 's/#38383d/#1e1e2e/g' patched/res/values/colors.xml
-sed -i 's/#2a2a2e/#181825/g' patched/res/values/colors.xml
-sed -i 's/#0c0c0d/#11111b/g' patched/res/values/colors.xml
+photon_color_files=(
+	"patched/res/values/colors.xml"
+	"patched/res/values/photon_colors.xml"
+)
+
+for file in "${photon_color_files[@]}"; do
+	[ -f "$file" ] || continue
+	sed -i 's/#f9f9fa/#bac2de/g' "$file"
+	sed -i 's/#ededf0/#a6adc8/g' "$file"
+	sed -i 's/#d7d7db/#6c7086/g' "$file"
+	sed -i 's/#b1b1b3/#585b70/g' "$file"
+	sed -i 's/#737373/#45475a/g' "$file"
+	sed -i 's/#4a4a4f/#313244/g' "$file"
+	sed -i 's/#38383d/#1e1e2e/g' "$file"
+	sed -i 's/#2a2a2e/#181825/g' "$file"
+	sed -i 's/#0c0c0d/#11111b/g' "$file"
+	sed -i 's/#ff5b5b66/#ffbac2de/g' "$file"
+	sed -i 's/#735b5b66/#ff6c7086/g' "$file"
+	sed -i 's/#ff52525e/#ff585b70/g' "$file"
+	sed -i 's/#ff4a4a55/#ff45475a/g' "$file"
+	sed -i 's/#ff42414d/#ff1e1e2e/g' "$file"
+	sed -i 's/#f242414d/#ff313244/g' "$file"
+	sed -i 's/#f542414d/#ff313244/g' "$file"
+	sed -i 's/#ff3a3944/#ff313244/g' "$file"
+	sed -i 's/#ff32313c/#ff1e1e2e/g' "$file"
+	sed -i 's/#ff2b2a33/#ff11111b/g' "$file"
+	sed -i 's/#ff23222b/#ff181825/g' "$file"
+	sed -i 's/#ff1c1b22/#ff0c0c12/g' "$file"
+	sed -i 's/#ff15141a/#ff11111b/g' "$file"
+	sed -i 's/#6615141a/#ff11111b/g' "$file"
+	sed -i 's/#8015141a/#ff11111b/g' "$file"
+	sed -i 's/#9915141a/#ff11111b/g' "$file"
+	sed -i 's/#f215141a/#ff11111b/g' "$file"
+	sed -i 's/#f515141a/#ff11111b/g' "$file"
+done
 
 # Patch readerview.css
 sed -i 's/1c1b22/1e1e2e/g' patched/assets/extensions/readerview/readerview.css
