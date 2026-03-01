@@ -3,6 +3,17 @@
 ## This script adapts the upstream CI workflow for GitHub Actions runners.
 ## It delegates to the upstream scripts (get_sources.sh, prebuild.sh, build.sh)
 ## and handles GitHub Actions-specific signing and artifact collection.
+##
+## The upstream CI pipeline expects per-arch jobs to only build GeckoView AARs
+## (IRONFOX_CI=1 skips Fenix for non-bundle builds), with a final "bundle" job
+## assembling them into APKs.  GitHub Actions builds each arch independently and
+## needs a complete APK per job, so we:
+##   1. Source env with IRONFOX_CI=1 to pick up CI-specific config (keystore
+##      paths, SB key, etc.—including any docker-build.yml sed patches).
+##   2. Switch to IRONFOX_CI=0 before calling build scripts so the upstream
+##      code performs a full build (including Fenix APK assembly).
+##   3. Handle signing here, since upstream sign.sh has a naming mismatch
+##      for non-bundle single-arch builds.
 
 set -eu
 set -o pipefail
@@ -23,8 +34,6 @@ arm|arm64|x86_64|bundle)
     ;;
 esac
 
-export IRONFOX_CI=1
-
 export CI_PIPELINE_CREATED_AT="${CI_PIPELINE_CREATED_AT:-$(date -Iseconds)}"
 export IF_BUILD_DATE="${CI_PIPELINE_CREATED_AT}"
 
@@ -35,8 +44,11 @@ else
     echo_green_text "Preparing to build IronFox (Release)..."
 fi
 
+export IRONFOX_CI=1
 bash -x "$(dirname "$0")/env.sh"
 source "$(dirname "$0")/env.sh"
+
+export IRONFOX_CI=0
 
 export JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS:-} -Xmx4g -XX:MaxMetaspaceSize=2g"
 export _JAVA_OPTIONS="${_JAVA_OPTIONS:-} -XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=${IRONFOX_ARTIFACTS}/heapdump.hprof"
@@ -73,18 +85,28 @@ if [[ "${BUILD_VARIANT}" != "bundle" ]]; then
         x86_64) ABI="x86_64" ;;
     esac
 
-    if [[ "${IRONFOX_SIGN:-0}" == "1" ]]; then
-        APK_IN="${IRONFOX_OUTPUTS_APK}/ironfox-${IRONFOX_CHANNEL}-${ABI}-signed.apk"
-    else
-        APK_IN="${IRONFOX_OUTPUTS_APK}/ironfox-${IRONFOX_CHANNEL}-${ABI}.apk"
-    fi
-
     APK_OUT="${IRONFOX_APK_ARTIFACTS}/IronFox-v${IRONFOX_VERSION}-${ABI}.apk"
+    APK_UNSIGNED="${IRONFOX_OUTPUTS_APK}/ironfox-${IRONFOX_CHANNEL}-${ABI}.apk"
+    APK_SIGNED="${IRONFOX_OUTPUTS_APK}/ironfox-${IRONFOX_CHANNEL}-${ABI}-signed.apk"
 
-    if [[ -f "$APK_IN" ]]; then
-        cp -v "${APK_IN}" "${APK_OUT}"
+    if [[ -f "${APK_SIGNED}" ]]; then
+        cp -v "${APK_SIGNED}" "${APK_OUT}"
+    elif [[ -f "${APK_UNSIGNED}" ]]; then
+        if [[ "${IRONFOX_SIGN:-0}" == "1" ]] && [[ -f "${IRONFOX_KEYSTORE}" ]]; then
+            echo_green_text "Signing APK (${ABI})..."
+            "${IRONFOX_ANDROID_SDK}/build-tools/${ANDROID_BUILDTOOLS_VERSION}/apksigner" sign \
+                --ks="${IRONFOX_KEYSTORE}" \
+                --ks-pass="file:/${IRONFOX_KEYSTORE_PASS_FILE}" \
+                --ks-key-alias="${IRONFOX_KEYSTORE_KEY_ALIAS}" \
+                --key-pass="file:/${IRONFOX_KEYSTORE_KEY_PASS_FILE}" \
+                --out="${APK_OUT}" \
+                "${APK_UNSIGNED}"
+            echo_green_text "Signed APK: ${APK_OUT}"
+        else
+            cp -v "${APK_UNSIGNED}" "${APK_OUT}"
+        fi
     else
-        echo_red_text "Warning: Expected APK not found at ${APK_IN}, searching for alternatives..."
+        echo_red_text "Warning: Expected APK not found at ${APK_UNSIGNED}, searching for alternatives..."
         APK_IN=$(find "${IRONFOX_OUTPUTS_APK}" "${IRONFOX_GECKO}/obj" -name "*.apk" \( -name "*${ABI}*" -o -name "*${BUILD_VARIANT}*" \) 2>/dev/null | head -n1 || true)
         if [[ -n "$APK_IN" ]]; then
             echo_green_text "Found APK at: ${APK_IN}"
